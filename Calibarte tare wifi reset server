@@ -1,0 +1,1573 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <EEPROM.h>
+#include <WiFiClient.h>
+#include "HX711.h"
+
+WebServer server(80);
+
+// HX711 scale setup
+HX711 scale;
+const int LOADCELL_DOUT_PIN = 18;  // GPIO18
+const int LOADCELL_SCK_PIN = 19;   // GPIO19
+
+// LED setup (optional status indicators)
+const int ledPin1 = 2;      // First LED pin
+const int ledPin2 = 3;      // Second LED pin
+bool weightReadingInProgress = true;
+
+// EEPROM structure
+struct Config {
+  char ssid[33];
+  char password[65];
+  bool configured;
+  char serverIP[32];
+  int serverPort;
+  int scaleID;
+  char host[16];
+  bool dhcp;
+  char ip[16];
+  char gateway[16];
+  char mask[16];
+  char pdns[16];
+  char sdns[16];
+  float calibrationFactor;
+  float knownWeight;
+};
+
+Config config;
+
+// Weight counters
+struct WeightCounters {
+  uint32_t totalReadings;
+  uint32_t successfulTransmissions;
+  uint32_t failedTransmissions;
+  float maxWeight;
+  float minWeight;
+  float totalWeight;
+};
+
+WeightCounters counters;
+
+String serialBuffer = "";
+
+// Weight reading storage
+struct WeightReading {
+  float weight;
+  String timestamp;
+  String unit;
+};
+
+const int MAX_READINGS = 50;
+WeightReading weightList[MAX_READINGS];
+int readingCount = 0;
+
+// Scale status
+String scaleStatus = "Not Calibrated";
+String urlStatus = "Disconnected";
+String lastTareResponse = "";
+String currentUnit = "g";
+
+// Scale variables
+bool isTaring = false;
+unsigned long lastStableReading = 0;
+float lastStableWeight = 0;
+bool weightStable = false;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize EEPROM for ESP32
+  EEPROM.begin(sizeof(config) + sizeof(counters));
+  
+  Serial.println("\n=== ESP32 Smart Weight Scale ===");
+  
+  // Initialize LEDs
+  pinMode(ledPin1, OUTPUT);
+  pinMode(ledPin2, OUTPUT);
+  digitalWrite(ledPin1, LOW);
+  digitalWrite(ledPin2, LOW);
+  
+  // Initialize HX711
+  initializeScale();
+  
+  // Load configuration from EEPROM
+  loadConfig();
+  
+  // Apply network configuration
+  applyNetworkConfig();
+  
+  if (config.configured) {
+    connectToWiFi();
+  } else {
+    startAPMode();
+  }
+  
+  setupWebServer();
+  loadCounters();
+  
+  Serial.println("=== System Ready ===");
+  Serial.println("Ready for weight measurements...\n");
+}
+
+void loop() {
+  server.handleClient();
+  
+  // Handle weight readings
+  handleScaleReadings();
+  
+  // Handle serial input
+  if (Serial.available()) {
+    String data = Serial.readString();
+    serialBuffer += data;
+    
+    // Keep buffer size manageable
+    if (serialBuffer.length() > 4000) {
+      serialBuffer = serialBuffer.substring(serialBuffer.length() - 3000);
+    }
+  }
+  
+  // Periodically check scale status
+  static unsigned long lastStatusCheck = 0;
+  if (millis() - lastStatusCheck > 30000) {
+    checkScaleStatus();
+    lastStatusCheck = millis();
+  }
+}
+
+void turnOnLEDs() {
+  digitalWrite(ledPin1, HIGH);
+  digitalWrite(ledPin2, HIGH);
+}
+ 
+void turnOffLEDs() {
+  digitalWrite(ledPin1, LOW);
+  digitalWrite(ledPin2, LOW);
+}
+
+void initializeScale() {
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  delay(2000);
+
+  if (scale.is_ready()) {
+    Serial.println("âœ“ HX711 found and ready!");
+    
+    // Set scale calibration factor
+    // Set scale calibration factor (allow negative, but not zero)
+    scale.set_scale(abs(config.calibrationFactor) > 0.00001 ? config.calibrationFactor : 25.21);
+    
+    // Reset the scale to 0
+    Serial.println("Taring scale... Remove any weight from scale.");
+    scale.tare();
+    Serial.println("Tare complete.");
+    
+    if (config.calibrationFactor <= 0) {
+      Serial.println("\n=== Reading Scale Values ===");
+      Serial.println("Place known weight on scale for calibration");
+      Serial.println("=====================================");
+    }
+  } else {
+    Serial.println("âœ— HX711 not found!");
+    
+    while(1) {
+      delay(1000);
+      Serial.println("HX711 not detected - Check wiring and restart");
+    }
+  }
+}
+
+void handleScaleReadings() {
+  static unsigned long lastReadingTime = 0;
+  
+  // Take readings every 500ms
+  if (millis() - lastReadingTime > 500) {
+    if (scale.is_ready()) {
+      float weight = scale.get_units(1);
+      
+      // Update statistics
+      updateWeightStatistics(weight);
+      
+      // Check if weight is stable
+      checkWeightStability(weight);
+      
+      // Store reading if it's stable and different from last stable reading
+      if (weightStable && abs(weight - lastStableWeight) > 0.1) {
+        storeWeightReading(weight);
+        lastStableWeight = weight;
+        
+        // Auto-send to server if configured and connected
+        if (WiFi.status() == WL_CONNECTED && strlen(config.serverIP) > 0) {
+          forwardWeightToServer(weight);
+        }
+        
+        Serial.println("=== WEIGHT READING STORED ===");
+        Serial.println("Weight: " + String(weight, 2) + currentUnit);
+      } else if (weightStable) {
+        // Weight is stable but hasn't changed much
+        Serial.println("Current weight: " + String(weight, 2) + currentUnit + " (stable)");
+      } else {
+        // Weight not stable yet
+        Serial.println("Current weight: " + String(weight, 2) + currentUnit + " (unstable)");
+      }
+    } else {
+      Serial.println("[SCALE] HX711 not found, check wiring");
+    }
+    
+    lastReadingTime = millis();
+  }
+}
+
+void checkWeightStability(float currentWeight) {
+  static float previousWeights[5] = {0};
+  static int weightIndex = 0;
+  static unsigned long lastWeightTime = 0;
+  
+  // Store current weight in circular buffer
+  previousWeights[weightIndex] = currentWeight;
+  weightIndex = (weightIndex + 1) % 5;
+  
+  // Check stability every 500ms
+  if (millis() - lastWeightTime > 500) {
+    float avg = 0;
+    float variance = 0;
+    
+    // Calculate average
+    for (int i = 0; i < 5; i++) {
+      avg += previousWeights[i];
+    }
+    avg /= 5;
+    
+    // Calculate variance
+    for (int i = 0; i < 5; i++) {
+      variance += pow(previousWeights[i] - avg, 2);
+    }
+    variance /= 5;
+    
+    // Weight is stable if variance is low
+    weightStable = (variance < 0.5);
+    
+    if (weightStable) {
+      lastStableReading = millis();
+    }
+    
+    lastWeightTime = millis();
+  }
+}
+
+void updateWeightStatistics(float weight) {
+  counters.totalReadings++;
+  counters.totalWeight += weight;
+  
+  if (weight > counters.maxWeight) {
+    counters.maxWeight = weight;
+  }
+  
+  if (weight < counters.minWeight || counters.minWeight == 0) {
+    counters.minWeight = weight;
+  }
+  
+  // Save counters periodically
+  static unsigned long lastSave = 0;
+  if (millis() - lastSave > 60000) {
+    saveCounters();
+    lastSave = millis();
+  }
+}
+
+void storeWeightReading(float weight) {
+  String timestamp = getDateTime();
+  
+  if (readingCount < MAX_READINGS) {
+    weightList[readingCount].weight = weight;
+    weightList[readingCount].timestamp = timestamp;
+    weightList[readingCount].unit = currentUnit;
+    readingCount++;
+  } else {
+    // Shift array to make space
+    for (int i = 0; i < MAX_READINGS - 1; i++) {
+      weightList[i] = weightList[i + 1];
+    }
+    weightList[MAX_READINGS - 1].weight = weight;
+    weightList[MAX_READINGS - 1].timestamp = timestamp;
+    weightList[MAX_READINGS - 1].unit = currentUnit;
+  }
+  
+  Serial.println("[SCALE] Stored reading: " + String(weight, 2) + currentUnit + " at " + timestamp);
+}
+
+void applyNetworkConfig() {
+  if (strlen(config.host) > 0) {
+    WiFi.setHostname(config.host);
+  }
+  
+  if (!config.dhcp && strlen(config.ip) > 0) {
+    IPAddress ip, gateway, mask, pdns, sdns;
+    
+    if (ip.fromString(config.ip) && 
+        gateway.fromString(config.gateway) && 
+        mask.fromString(config.mask)) {
+      
+      if (pdns.fromString(config.pdns)) {
+        if (sdns.fromString(config.sdns)) {
+          WiFi.config(ip, gateway, mask, pdns, sdns);
+        } else {
+          WiFi.config(ip, gateway, mask, pdns);
+        }
+      } else {
+        WiFi.config(ip, gateway, mask);
+      }
+      Serial.println("[NETWORK] Static IP configuration applied");
+    }
+  } else {
+    Serial.println("[NETWORK] DHCP configuration");
+  }
+}
+
+void loadConfig() {
+  EEPROM.get(0, config);
+  if (!config.configured) {
+    memset(&config, 0, sizeof(config));
+    strcpy(config.serverIP, "192.168.1.134");
+    config.serverPort = 80;
+    config.scaleID = 200;
+    strcpy(config.host, "ESP32-Scale");
+    config.dhcp = true;
+    strcpy(config.ip, "192.168.1.69");
+    strcpy(config.gateway, "192.168.1.1");
+    strcpy(config.mask, "255.255.255.0");
+    strcpy(config.pdns, "8.8.8.8");
+    strcpy(config.sdns, "8.8.4.4");
+    config.calibrationFactor = 1.0;
+    config.knownWeight = 100.0;
+    config.configured = false;
+  }
+}
+
+void saveConfig() {
+  EEPROM.put(0, config);
+  EEPROM.commit();
+  Serial.println("[CONFIG] Configuration saved to EEPROM");
+}
+
+void loadCounters() {
+  EEPROM.get(sizeof(config), counters);
+  if (counters.totalReadings > 1000000) counters.totalReadings = 0;
+  if (counters.successfulTransmissions > 1000000) counters.successfulTransmissions = 0;
+  if (counters.failedTransmissions > 1000000) counters.failedTransmissions = 0;
+}
+
+void saveCounters() {
+  EEPROM.put(sizeof(config), counters);
+  EEPROM.commit();
+}
+
+void connectToWiFi() {
+  WiFi.mode(WIFI_STA);
+  applyNetworkConfig();
+  WiFi.begin(config.ssid, config.password);
+  
+  Serial.print("[WiFi] Connecting to ");
+  Serial.println(config.ssid);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] Connected! IP: " + WiFi.localIP().toString());
+    urlStatus = "Connected";
+  } else {
+    Serial.println("\n[WiFi] Failed to connect");
+    startAPMode();
+  }
+}
+
+void startAPMode() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("ESP32-SCALE", "password");
+  Serial.println("[WiFi] AP Mode Started: ESP32-SCALE");
+  Serial.println("IP: " + WiFi.softAPIP().toString());
+  urlStatus = "AP Mode";
+}
+
+bool forwardWeightToServer(float weight) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[SERVER] ERROR: Cannot forward - WiFi disconnected");
+    return false;
+  }
+
+  WiFiClient client;
+  
+  String url = "/?scaleid=" + String(config.scaleID);
+  url += "&weight_type=W";
+  url += "&weight_value=" + String(weight, 2);
+  url += "&unit=" + currentUnit;
+  url += "&date=" + getDateTime();
+  
+  Serial.println("[SERVER] Forwarding to: http://" + String(config.serverIP) + ":" + String(config.serverPort) + url);
+  
+  if (client.connect(config.serverIP, config.serverPort)) {
+    client.println("GET " + url + " HTTP/1.1");
+    client.println("Host: " + String(config.serverIP) + ":" + String(config.serverPort));
+    client.println("User-Agent: ESP32-WeightScale/1.0");
+    client.println("Connection: close");
+    client.println();
+    
+    unsigned long timeout = millis();
+    while (client.available() == 0) {
+      if (millis() - timeout > 10000) {
+        Serial.println("[SERVER] ERROR: Client Timeout!");
+        client.stop();
+        counters.failedTransmissions++;
+        saveCounters();
+        return false;
+      }
+      delay(10);
+    }
+    
+    String statusLine = client.readStringUntil('\n');
+    Serial.println("[SERVER] Response: " + statusLine);
+    
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      if (line == "\r") {
+        break;
+      }
+    }
+    
+    String responseBody = "";
+    while (client.available()) {
+      responseBody += client.readString();
+    }
+    
+    client.stop();
+    
+    if (statusLine.indexOf("200") > 0) {
+      Serial.println("[SERVER] SUCCESS: HTTP 200 OK");
+      counters.successfulTransmissions++;
+      saveCounters();
+      return true;
+    } else if (statusLine.indexOf("201") > 0) {
+      Serial.println("[SERVER] SUCCESS: HTTP 201 Created");
+      counters.successfulTransmissions++;
+      saveCounters();
+      return true;
+    } else {
+      Serial.println("[SERVER] ERROR: HTTP Status: " + statusLine);
+      Serial.println("[SERVER] Response Body: " + responseBody);
+      counters.failedTransmissions++;
+      saveCounters();
+      return false;
+    }
+  } else {
+    Serial.println("[SERVER] ERROR: Connection failed to " + String(config.serverIP) + ":" + String(config.serverPort));
+    counters.failedTransmissions++;
+    saveCounters();
+    return false;
+  }
+}
+
+String getDateTime() {
+  unsigned long seconds = millis() / 1000;
+  unsigned long minutes = seconds / 60;
+  unsigned long hours = minutes / 60;
+  unsigned long days = hours / 24;
+  
+  hours = hours % 24;
+  minutes = minutes % 60;
+  seconds = seconds % 60;
+  
+  char buffer[20];
+  snprintf(buffer, sizeof(buffer), "%02lu/%02lu/%04lu,%02lu:%02lu:%02lu", 
+           1, 1, 2024, hours, minutes, seconds);
+  return String(buffer);
+}
+
+void checkScaleStatus() {
+  if (scale.is_ready()) {
+    if (config.calibrationFactor > 0) {
+      scaleStatus = "Calibrated";
+    } else {
+      scaleStatus = "Ready (Needs Calibration)";
+    }
+  } else {
+    scaleStatus = "Hardware Error";
+  }
+}
+
+// ============================ CALIBRATION FUNCTIONS ============================
+
+bool calibrateScale(float knownWeight) {
+  Serial.println("[CALIBRATION] Step 2: Measuring known weight (" + String(knownWeight) + "g)...");
+  
+  if (!scale.is_ready()) {
+    Serial.println("[CALIBRATION] ERROR: HX711 not found.");
+    return false;
+  }
+
+  scale.set_scale(1.0); // Reset scale to raw mode
+  float reading = scale.get_units(10);
+  
+  Serial.print("[CALIBRATION] Raw Reading: ");
+  Serial.println(reading);
+
+  // Validation: If the raw delta is too small, something is wrong
+  if (abs(reading) < 50) {
+    Serial.println("[CALIBRATION] ERROR: Reading too small! Did you place the weight?");
+    return false;
+  }
+
+  float calibrationFactor = reading / knownWeight;
+  config.calibrationFactor = calibrationFactor;
+  config.knownWeight = knownWeight;
+  scale.set_scale(calibrationFactor);
+  
+  Serial.println("[CALIBRATION] SUCCESS!");
+  Serial.println("[CALIBRATION] New Factor: " + String(calibrationFactor, 6));
+  
+  saveConfig();
+  scaleStatus = "Calibrated";
+  return true;
+}
+
+bool tareScale() {
+  if (!scale.is_ready()) {
+    Serial.println("[TARE] ERROR: Scale not ready");
+    return false;
+  }
+  
+  Serial.println("[TARE] Taring scale... Please ensure no weight on scale");
+  
+  unsigned long startTime = millis();
+  float currentReading = 0;
+  int stableCount = 0;
+  
+  while (millis() - startTime < 15000) {
+    if (scale.is_ready()) {
+      float newReading = scale.get_units(1);
+      
+      if (abs(newReading - currentReading) < 50) {
+        stableCount++;
+      } else {
+        stableCount = 0;
+        currentReading = newReading;
+      }
+      
+      if (stableCount > 5) {
+        scale.tare();
+        Serial.println("[TARE] SUCCESS: Scale tared");
+        lastTareResponse = "TARE SUCCESS - Scale zeroed";
+        return true;
+      }
+    }
+    delay(500);
+  }
+  
+  Serial.println("[TARE] ERROR: Timeout - could not get stable zero reading");
+  lastTareResponse = "TARE FAIL - Could not zero scale";
+  return false;
+}
+
+// ============================ WEB SERVER SETUP ============================
+
+// HTML fragments stored in PROGMEM
+const char HTML_HEADER[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Smart Weight Scale</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: Arial, sans-serif; background: #f0f0f0; }
+        .header { background: #4CAF50; color: white; padding: 15px; text-align: center; }
+        .tabs { display: flex; background: #333; flex-wrap: wrap; }
+        .tab { padding: 15px 20px; color: white; cursor: pointer; border: none; background: #444; }
+        .tab.active { background: #4CAF50; }
+        .content { display: none; padding: 20px; background: white; margin: 20px; border-radius: 5px; }
+        .content.active { display: block; }
+        .weight-display { font-size: 3em; text-align: center; padding: 20px; margin: 20px 0; background: #f5f5f5; border-radius: 10px; }
+        .weight-stable { background: #d4edda; color: #155724; }
+        .weight-unstable { background: #fff3cd; color: #856404; }
+        .wifi-list { margin: 10px 0; }
+        .wifi-item { padding: 10px; margin: 5px 0; background: #f5f5f5; border-radius: 3px; cursor: pointer; }
+        .wifi-item:hover { background: #e0e0e0; }
+        input, button, textarea, select { padding: 10px; margin: 5px 0; width: 100%; }
+        .btn { background: #4CAF50; color: white; border: none; padding: 10px; border-radius: 3px; cursor: pointer; margin: 5px; }
+        .btn.danger { background: #f44336; }
+        .btn.success { background: #4CAF50; }
+        .btn.warning { background: #ff9800; }
+        .btn.info { background: #2196F3; }
+        .terminal { background: #000; color: #0f0; font-family: monospace; padding: 10px; height: 300px; overflow-y: auto; white-space: pre-wrap; }
+        .form-group { margin: 10px 0; }
+        .counter-display { background: #f5f5f5; padding: 10px; margin: 5px 0; border-radius: 3px; text-align: center; }
+        .status { padding: 10px; margin: 10px 0; border-radius: 3px; }
+        .status.connected { background: #d4edda; color: #155724; }
+        .status.disconnected { background: #f8d7da; color: #721c24; }
+        .status.pending { background: #fff3cd; color: #856404; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
+        .reading-container { border: 1px solid #ddd; padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .config-table { width: 100%; border-collapse: collapse; }
+        .config-table td { padding: 8px; border: 1px solid #ddd; }
+        .config-table tr:nth-child(even) { background: #f9f9f9; }
+        .at-buttons { display: flex; flex-wrap: wrap; gap: 5px; margin: 10px 0; }
+        .at-buttons .btn { flex: 1; min-width: 80px; }
+        .password-container { position: relative; width: 100%; }
+        .password-container input { padding-right: 40px !important; }
+        .password-toggle { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; font-size: 16px; width: auto !important; padding: 0 !important; margin: 0 !important; }
+        .network-fields { display: none; }
+        .network-fields.active { display: block; }
+        .calibration-section { background: #e7f3ff; padding: 15px; border-radius: 5px; margin: 10px 0; }
+    </style>
+</head>
+)rawliteral";
+
+const char HTML_BODY_START[] PROGMEM = R"rawliteral(
+<body>
+    <div class="header">
+        <h1>ESP32 Smart Weight Scale</h1>
+        <div id="wifiStatus">WiFi Status: Loading...</div>
+        <div id="scaleStatus">Scale Status: Loading...</div>
+    </div>
+)rawliteral";
+
+const char HTML_TABS[] PROGMEM = R"rawliteral(
+    <div class="tabs">
+        <button class="tab active" onclick="showTab('dashboard')">Dashboard</button>
+        <button class="tab" onclick="showTab('calibrate')">Calibrate</button>
+        <button class="tab" onclick="showTab('wifi')">WiFi</button>
+        <button class="tab" onclick="showTab('readings')">Readings</button>
+        <button class="tab" onclick="showTab('config')">Configuration</button>
+        <button class="tab" onclick="showTab('network')">Network</button>
+        <button class="tab" onclick="showTab('reset')">Reset</button>
+    </div>
+)rawliteral";
+
+const char HTML_DASHBOARD_TAB[] PROGMEM = R"rawliteral(
+    <div id="dashboard" class="content active">
+        <h2>Weight Scale Dashboard</h2>
+        
+        <div class="weight-display" id="currentWeight">
+            --.-- g
+        </div>
+        
+        <div class="status" id="weightStatus">
+            Waiting for stable reading...
+        </div>
+
+
+        <div class="grid">
+            <div class="counter-display">
+                <h4>Total Readings</h4>
+                <div id="totalReadings">0</div>
+            </div>
+            <div class="counter-display">
+                <h4>Successful Transmissions</h4>
+                <div id="successTransmissions">0</div>
+            </div>
+            <div class="counter-display">
+                <h4>Failed Transmissions</h4>
+                <div id="failedTransmissions">0</div>
+            </div>
+            <div class="counter-display">
+                <h4>Max Weight</h4>
+                <div id="maxWeight">0.00 g</div>
+            </div>
+            <div class="counter-display">
+                <h4>Min Weight</h4>
+                <div id="minWeight">0.00 g</div>
+            </div>
+            <div class="counter-display">
+                <h4>Avg Weight</h4>
+                <div id="avgWeight">0.00 g</div>
+            </div>
+        </div>
+
+        <div style="margin-top: 20px; text-align: center;">
+            <button class="btn info" onclick="tareScale()">Tare Scale</button>
+            <button class="btn success" onclick="sendCurrentWeight()">Send Current Weight</button>
+        </div>
+
+        <div class="form-group">
+            <h3>Scale Information</h3>
+            <table class="config-table">
+                <tr><td>Calibration Factor</td><td id="infoCalFactor">Loading...</td></tr>
+                <tr><td>Known Weight</td><td id="infoKnownWeight">Loading...</td></tr>
+                <tr><td>Current Unit</td><td id="infoUnit">Loading...</td></tr>
+                <tr><td>Scale Status</td><td id="infoScaleStatus">Loading...</td></tr>
+                <tr><td>URL Status</td><td id="infoUrlStatus">Loading...</td></tr>
+                <tr><td>Uptime</td><td id="infoUptime">Loading...</td></tr>
+            </table>
+        </div>
+        <button class="btn" onclick="refreshDashboard()">Refresh</button>
+    </div>
+)rawliteral";
+
+const char HTML_CALIBRATE_TAB[] PROGMEM = R"rawliteral(
+    <div id="calibrate" class="content">
+        <h2>Scale Calibration</h2>
+        
+        <div id="calStep1" class="calibration-section">
+            <h3>Step 1: Zero the Scale</h3>
+            <p style="color: #666; margin-bottom: 10px;">Remove all items and weights from the scale platform.</p>
+            <button class="btn warning" onclick="runCalStep1()">Zero Scale (Empty)</button>
+            <div id="calStep1Result"></div>
+        </div>
+ 
+        <div id="calStep2" class="calibration-section" style="display:none">
+            <h3>Step 2: Place Known Weight</h3>
+            <p style="color: #666; margin-bottom: 10px;">Place a weight on the scale and enter its exact value in grams below:</p>
+            <input type="number" id="knownWeight" step="0.1" placeholder="Weight in grams (e.g. 100)" value="100.0">
+            <button class="btn success" onclick="runCalStep2()">Finish Calibration</button>
+            <div id="calStep2Result"></div>
+            <button class="btn info" style="margin-top: 10px;" onclick="resetCalWizard()">â† Back to Step 1</button>
+        </div>
+
+        <div class="calibration-section">
+            <h3>Current Calibration</h3>
+            <table class="config-table">
+                <tr><td>Calibration Factor</td><td id="currentCalFactor">Loading...</td></tr>
+                <tr><td>Known Weight</td><td id="currentKnownWeight">Loading...</td></tr>
+                <tr><td>Scale Status</td><td id="currentScaleStatus">Loading...</td></tr>
+            </table>
+            <button class="btn danger" onclick="resetCalibration()">Reset Calibration</button>
+        </div>
+
+        <div class="calibration-section">
+            <h3>Test Calibration</h3>
+            <p>Place a test weight on the scale to verify calibration:</p>
+            <div id="testWeightDisplay" class="weight-display">--.-- g</div>
+            <button class="btn info" onclick="refreshTestWeight()">Refresh Test Weight</button>
+        </div>
+    </div>
+)rawliteral";
+
+const char HTML_WIFI_TAB[] PROGMEM = R"rawliteral(
+    <div id="wifi" class="content">
+        <h2>WiFi Configuration</h2>
+        <button class="btn" onclick="scanNetworks()">Scan Networks</button>
+        <div id="networks"></div>
+        <div id="wifiForm" style="display:none">
+            <input type="text" id="selectedSSID" readonly>
+            <div class="password-container">
+                <input type="password" id="password" placeholder="Password">
+                <button type="button" class="password-toggle" onclick="togglePassword()">ðŸ‘ï¸</button>
+            </div>
+            <button class="btn" onclick="connectWiFi()">Connect</button>
+        </div>
+        <div style="margin-top: 20px;">
+            <button class="btn danger" onclick="resetWiFi()">Reset WiFi</button>
+            <button class="btn danger" onclick="factoryReset()">Factory Reset</button>
+        </div>
+    </div>
+)rawliteral";
+
+const char HTML_READINGS_TAB[] PROGMEM = R"rawliteral(
+    <div id="readings" class="content">
+        <h2>Weight Readings</h2>
+        
+        <div class="form-group">
+            <h3>Recent Weight Readings</h3>
+            <div id="weightReadings" style="max-height: 400px; overflow-y: auto;"></div>
+            <button class="btn" onclick="clearReadings()">Clear Readings</button>
+        </div>
+
+        <div class="form-group">
+            <h3>Manual Weight Entry</h3>
+            <input type="number" id="manualWeight" step="0.01" placeholder="Weight value">
+            <select id="manualUnit">
+                <option value="g">Grams (g)</option>
+                <option value="kg">Kilograms (kg)</option>
+                <option value="lb">Pounds (lb)</option>
+            </select>
+            <button class="btn success" onclick="addManualReading()">Add Manual Reading</button>
+        </div>
+    </div>
+)rawliteral";
+
+const char HTML_CONFIG_TAB[] PROGMEM = R"rawliteral(
+    <div id="config" class="content">
+        <h2>Server Configuration</h2>
+        
+        <div class="form-group">
+            <h3>Server Settings</h3>
+            <input type="text" id="serverIP" placeholder="Server IP">
+            <input type="number" id="serverPort" placeholder="Server Port">
+            <input type="number" id="scaleID" placeholder="Scale ID (0-99999)" min="0" max="99999">
+            <button class="btn" onclick="saveConfig()">Save Configuration</button>
+        </div>
+
+        <div class="form-group">
+            <h3>Scale Settings</h3>
+            <select id="weightUnit">
+                <option value="g">Grams (g)</option>
+                <option value="kg">Kilograms (kg)</option>
+                <option value="lb">Pounds (lb)</option>
+            </select>
+            <input type="number" id="decimalPlaces" min="0" max="3" value="2" placeholder="Decimal Places">
+            <button class="btn" onclick="saveScaleSettings()">Save Scale Settings</button>
+        </div>
+    </div>
+)rawliteral";
+
+const char HTML_NETWORK_TAB[] PROGMEM = R"rawliteral(
+    <div id="network" class="content">
+        <h2>Network Configuration</h2>
+        
+        <div class="form-group">
+            <h3>Network Settings</h3>
+            <input type="text" id="host" placeholder="Host Name">
+            
+            <label style="display: block; margin: 10px 0;">
+                <input type="checkbox" id="dhcp" onchange="toggleNetworkFields()"> Enable DHCP
+            </label>
+            
+            <div id="networkFields" class="network-fields">
+                <input type="text" id="ip" placeholder="IP Address">
+                <input type="text" id="gateway" placeholder="Gateway">
+                <input type="text" id="mask" placeholder="Subnet Mask">
+                <input type="text" id="pdns" placeholder="Primary DNS">
+                <input type="text" id="sdns" placeholder="Secondary DNS">
+            </div>
+            
+            <button class="btn" onclick="saveNetworkConfig()">Save Network Settings</button>
+            <button class="btn" onclick="applyNetworkConfig()">Apply & Reboot</button>
+        </div>
+        
+        <div class="form-group">
+            <h3>Current Network Status</h3>
+            <table class="config-table">
+                <tr><td>Hostname</td><td id="currentHost">Loading...</td></tr>
+                <tr><td>IP Address</td><td id="currentIp">Loading...</td></tr>
+                <tr><td>Gateway</td><td id="currentGateway">Loading...</td></tr>
+                <tr><td>Subnet Mask</td><td id="currentMask">Loading...</td></tr>
+                <tr><td>DNS Servers</td><td id="currentDns">Loading...</td></tr>
+            </table>
+        </div>
+    </div>
+)rawliteral";
+
+const char HTML_RESET_TAB[] PROGMEM = R"rawliteral(
+    <div id="reset" class="content">
+        <h2>Reset Counters</h2>
+        
+        <div class="form-group">
+            <h3>Reset Weight Counters</h3>
+            <button class="btn danger" onclick="resetCounter('readings')">Reset Total Readings</button>
+            <button class="btn danger" onclick="resetCounter('success')">Reset Success Counter</button>
+            <button class="btn danger" onclick="resetCounter('failed')">Reset Failed Counter</button>
+            <button class="btn danger" onclick="resetCounter('stats')">Reset Statistics</button>
+        </div>
+
+        <div class="form-group">
+            <h3>System Reset</h3>
+            <button class="btn danger" onclick="resetWiFi()">Reset WiFi Only</button>
+            <button class="btn danger" onclick="factoryReset()">Factory Reset (Erase All)</button>
+        </div>
+    </div>
+)rawliteral";
+
+const char HTML_SCRIPTS[] PROGMEM = R"rawliteral(
+    <script>
+        function showTab(tabName) {
+            document.querySelectorAll('.content').forEach(tab => tab.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(btn => btn.classList.remove('active'));
+            document.getElementById(tabName).classList.add('active');
+            event.target.classList.add('active');
+            
+            if(tabName === 'dashboard') refreshDashboard();
+            if(tabName === 'calibrate') refreshCalibration();
+            if(tabName === 'readings') refreshReadings();
+            if(tabName === 'network') refreshNetworkStatus();
+        }
+
+        function togglePassword() {
+            const password = document.getElementById('password');
+            const toggle = document.querySelector('.password-toggle');
+            if (password.type === 'password') {
+                password.type = 'text';
+                toggle.textContent = 'ðŸ™ˆ';
+            } else {
+                password.type = 'password';
+                toggle.textContent = 'ðŸ‘ï¸';
+            }
+        }
+
+        function toggleNetworkFields() {
+            const dhcp = document.getElementById('dhcp').checked;
+            const networkFields = document.getElementById('networkFields');
+            if (dhcp) {
+                networkFields.classList.remove('active');
+            } else {
+                networkFields.classList.add('active');
+            }
+        }
+
+        function scanNetworks() {
+            fetch('/scan').then(r => r.json()).then(networks => {
+                let div = document.getElementById('networks');
+                div.innerHTML = '';
+                networks.forEach(network => {
+                    let ndiv = document.createElement('div');
+                    ndiv.className = 'wifi-item';
+                    ndiv.innerHTML = network.ssid + ' (' + network.rssi + 'dBm)' + (network.encrypted ? ' ðŸ”’' : '');
+                    ndiv.onclick = () => {
+                        document.getElementById('selectedSSID').value = network.ssid;
+                        document.getElementById('wifiForm').style.display = 'block';
+                    };
+                    div.appendChild(ndiv);
+                });
+            });
+        }
+
+        function connectWiFi() {
+            let ssid = document.getElementById('selectedSSID').value;
+            let password = document.getElementById('password').value;
+            fetch('/connect', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'ssid=' + encodeURIComponent(ssid) + '&password=' + encodeURIComponent(password)
+            }).then(r => r.text()).then(alert);
+        }
+
+        function refreshDashboard() {
+            fetch('/overview').then(r => r.json()).then(data => {
+                document.getElementById('totalReadings').textContent = data.totalReadings;
+                document.getElementById('successTransmissions').textContent = data.successfulTransmissions;
+                document.getElementById('failedTransmissions').textContent = data.failedTransmissions;
+                document.getElementById('maxWeight').textContent = data.maxWeight.toFixed(2) + ' ' + data.unit;
+                document.getElementById('minWeight').textContent = data.minWeight.toFixed(2) + ' ' + data.unit;
+                document.getElementById('avgWeight').textContent = data.avgWeight.toFixed(2) + ' ' + data.unit;
+                
+                document.getElementById('infoCalFactor').textContent = data.calibrationFactor.toFixed(6);
+                document.getElementById('infoKnownWeight').textContent = data.knownWeight.toFixed(2) + ' g';
+                document.getElementById('infoUnit').textContent = data.unit;
+                document.getElementById('infoScaleStatus').textContent = data.scaleStatus;
+                document.getElementById('infoUrlStatus').textContent = data.urlStatus;
+                document.getElementById('infoUptime').textContent = data.uptime + 's';
+            });
+        }
+
+        function refreshCalibration() {
+            fetch('/calibrationstatus').then(r => r.json()).then(data => {
+                document.getElementById('currentCalFactor').textContent = data.calibrationFactor.toFixed(6);
+                document.getElementById('currentKnownWeight').textContent = data.knownWeight.toFixed(2) + ' g';
+                document.getElementById('currentScaleStatus').textContent = data.scaleStatus;
+            });
+        }
+
+        function refreshReadings() {
+            fetch('/getreadings').then(r => r.json()).then(readings => {
+                let readingsDiv = document.getElementById('weightReadings');
+                readingsDiv.innerHTML = '';
+                if(readings.length === 0) {
+                    readingsDiv.innerHTML = '<div class="status">No weight readings</div>';
+                } else {
+                    readings.forEach(reading => {
+                        let div = document.createElement('div');
+                        div.className = 'reading-container';
+                        div.innerHTML = '<strong>Weight:</strong> ' + reading.weight.toFixed(2) + ' ' + reading.unit + '<br><strong>Time:</strong> ' + reading.timestamp;
+                        readingsDiv.appendChild(div);
+                    });
+                }
+            });
+        }
+ 
+        function runCalStep1() {
+            const resultDiv = document.getElementById('calStep1Result');
+            resultDiv.innerHTML = '<div class="status pending">Zeroing scale... Please do not touch it.</div>';
+            
+            fetch('/tare', { method: 'POST' })
+                .then(r => r.text())
+                .then(result => {
+                    if(result.includes('SUCCESS')) {
+                        resultDiv.innerHTML = '<div class="status connected">Success! Scale zeroed.</div>';
+                        setTimeout(() => {
+                            document.getElementById('calStep1').style.display = 'none';
+                            document.getElementById('calStep2').style.display = 'block';
+                        }, 1000);
+                    } else {
+                        resultDiv.innerHTML = '<div class="status disconnected">' + result + '</div>';
+                    }
+                });
+        }
+ 
+        function runCalStep2() {
+            let knownWeight = parseFloat(document.getElementById('knownWeight').value);
+            if(!knownWeight || knownWeight <= 0) {
+                alert('Please enter a valid weight value');
+                return;
+            }
+            
+            const resultDiv = document.getElementById('calStep2Result');
+            resultDiv.innerHTML = '<div class="status pending">Measuring... Please wait.</div>';
+            
+            fetch('/calibrate', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'weight=' + knownWeight
+            }).then(r => r.text()).then(result => {
+                if(result.includes('SUCCESS')) {
+                    resultDiv.innerHTML = '<div class="status connected">' + result + '</div>';
+                    refreshCalibration();
+                } else {
+                    resultDiv.innerHTML = '<div class="status disconnected">' + result + '</div>';
+                }
+            });
+        }
+ 
+        function resetCalWizard() {
+            document.getElementById('calStep1').style.display = 'block';
+            document.getElementById('calStep2').style.display = 'none';
+            document.getElementById('calStep1Result').innerHTML = '';
+            document.getElementById('calStep2Result').innerHTML = '';
+        }
+
+        function resetCalibration() {
+            if(confirm('Reset calibration to defaults?')) {
+                fetch('/resetcalibration', { method: 'POST' })
+                    .then(r => r.text())
+                    .then(result => {
+                        alert(result);
+                        refreshCalibration();
+                    });
+            }
+        }
+
+        function sendCurrentWeight() {
+            fetch('/sendweight', { method: 'POST' })
+                .then(r => r.text())
+                .then(result => {
+                    alert('Server response: ' + result);
+                });
+        }
+
+        function refreshTestWeight() {
+            fetch('/currentweight').then(r => r.json()).then(data => {
+                let display = document.getElementById('testWeightDisplay');
+                display.textContent = data.weight.toFixed(2) + ' ' + data.unit;
+                if(data.stable) {
+                    display.className = 'weight-display weight-stable';
+                } else {
+                    display.className = 'weight-display weight-unstable';
+                }
+            });
+        }
+
+        function addManualReading() {
+            let weight = parseFloat(document.getElementById('manualWeight').value);
+            let unit = document.getElementById('manualUnit').value;
+            
+            if(!weight || weight <= 0) {
+                alert('Please enter a valid weight');
+                return;
+            }
+            
+            fetch('/addmanualreading', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'weight=' + weight + '&unit=' + unit
+            }).then(r => r.text()).then(result => {
+                alert(result);
+                refreshReadings();
+            });
+        }
+
+        function clearReadings() {
+            if(confirm('Clear all weight readings?')) {
+                fetch('/clearreadings').then(r => r.text()).then(() => refreshReadings());
+            }
+        }
+
+        function saveConfig() {
+            let ip = document.getElementById('serverIP').value;
+            let port = document.getElementById('serverPort').value;
+            let id = document.getElementById('scaleID').value;
+            fetch('/saveconfig', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'serverip=' + ip + '&serverport=' + port + '&scaleid=' + id
+            }).then(r => r.text()).then(alert);
+        }
+
+        function saveScaleSettings() {
+            let unit = document.getElementById('weightUnit').value;
+            let decimals = document.getElementById('decimalPlaces').value;
+            fetch('/savescalesettings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'unit=' + unit + '&decimals=' + decimals
+            }).then(r => r.text()).then(alert);
+        }
+
+        function saveNetworkConfig() {
+            let host = document.getElementById('host').value;
+            let dhcp = document.getElementById('dhcp').checked;
+            let ip = document.getElementById('ip').value;
+            let gateway = document.getElementById('gateway').value;
+            let mask = document.getElementById('mask').value;
+            let pdns = document.getElementById('pdns').value;
+            let sdns = document.getElementById('sdns').value;
+            
+            fetch('/savenetwork', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'host=' + encodeURIComponent(host) + '&dhcp=' + dhcp + '&ip=' + ip + '&gateway=' + gateway + '&mask=' + mask + '&pdns=' + pdns + '&sdns=' + sdns
+            }).then(r => r.text()).then(result => {
+                alert('Network configuration saved: ' + result);
+            });
+        }
+
+        function applyNetworkConfig() {
+            if(confirm('Apply network configuration and reboot?')) {
+                fetch('/applynetwork').then(r => r.text()).then(result => {
+                    alert('Network configuration applied: ' + result);
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 2000);
+                });
+            }
+        }
+
+        function refreshNetworkStatus() {
+            fetch('/networkstatus').then(r => r.json()).then(data => {
+                document.getElementById('currentHost').textContent = data.host || 'Not set';
+                document.getElementById('currentIp').textContent = data.ip || 'DHCP';
+                document.getElementById('currentGateway').textContent = data.gateway || 'DHCP';
+                document.getElementById('currentMask').textContent = data.mask || 'DHCP';
+                document.getElementById('currentDns').textContent = data.dns || 'DHCP';
+            });
+        }
+
+        function resetCounter(type) {
+            if(confirm('Reset ' + type + ' counter?')) {
+                fetch('/resetcounter', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: 'type=' + type
+                }).then(r => r.text()).then(alert);
+            }
+        }
+
+        function resetWiFi() {
+            if(confirm('Reset WiFi configuration?')) {
+                fetch('/resetwifi').then(r => r.text()).then(alert);
+            }
+        }
+
+        function factoryReset() {
+            if(confirm('Factory reset? This will erase all settings!')) {
+                fetch('/factoryreset').then(r => r.text()).then(alert);
+            }
+        }
+
+        // Real-time weight updates
+        setInterval(() => {
+            fetch('/currentweight').then(r => r.json()).then(data => {
+                let display = document.getElementById('currentWeight');
+                display.textContent = data.weight.toFixed(2) + ' ' + data.unit;
+                
+                let status = document.getElementById('weightStatus');
+                if(data.stable) {
+                    display.className = 'weight-display weight-stable';
+                    status.innerHTML = '<div class="status connected">Weight Stable</div>';
+                } else {
+                    display.className = 'weight-display weight-unstable';
+                    status.innerHTML = '<div class="status pending">Weight Unstable</div>';
+                }
+            });
+            
+            refreshDashboard();
+        }, 1000);
+
+        setInterval(() => {
+            fetch('/status').then(r => r.text()).then(status => {
+                document.getElementById('wifiStatus').textContent = 'WiFi Status: ' + status;
+            });
+            fetch('/scalestatus').then(r => r.text()).then(status => {
+                document.getElementById('scaleStatus').textContent = 'Scale Status: ' + status;
+            });
+        }, 3000);
+
+        // Load configuration on startup
+        window.onload = function() {
+            fetch('/getconfig').then(r => r.json()).then(config => {
+                document.getElementById('serverIP').value = config.serverIP || '192.168.1.134';
+                document.getElementById('serverPort').value = config.serverPort || 80;
+                document.getElementById('scaleID').value = config.scaleID || 200;
+                document.getElementById('host').value = config.host || 'ESP32-Scale';
+                document.getElementById('dhcp').checked = config.dhcp || true;
+                document.getElementById('ip').value = config.ip || '192.168.1.69';
+                document.getElementById('gateway').value = config.gateway || '192.168.1.1';
+                document.getElementById('mask').value = config.mask || '255.255.255.0';
+                document.getElementById('pdns').value = config.pdns || '8.8.8.8';
+                document.getElementById('sdns').value = config.sdns || '8.8.4.4';
+                
+                toggleNetworkFields();
+            });
+            refreshDashboard();
+            refreshNetworkStatus();
+        };
+    </script>
+)rawliteral";
+
+const char HTML_BODY_END[] PROGMEM = R"rawliteral(
+</body>
+</html>
+)rawliteral";
+
+// ============================ WEB SERVER HANDLERS ============================
+
+void handleRoot() {
+  String html = FPSTR(HTML_HEADER);
+  html += FPSTR(HTML_BODY_START);
+  html += FPSTR(HTML_TABS);
+  html += FPSTR(HTML_DASHBOARD_TAB);
+  html += FPSTR(HTML_CALIBRATE_TAB);
+  html += FPSTR(HTML_WIFI_TAB);
+  html += FPSTR(HTML_READINGS_TAB);
+  html += FPSTR(HTML_CONFIG_TAB);
+  html += FPSTR(HTML_NETWORK_TAB);
+  html += FPSTR(HTML_RESET_TAB);
+  html += FPSTR(HTML_SCRIPTS);
+  html += FPSTR(HTML_BODY_END);
+  
+  server.send(200, "text/html", html);
+}
+
+// Add piezo status handler
+
+void handleScan() {
+  String json = "[";
+  int n = WiFi.scanNetworks();
+  for (int i = 0; i < n; ++i) {
+    if (i) json += ",";
+    json += "{";
+    String ssid = WiFi.SSID(i);
+    ssid.replace("\\", "\\\\"); // Escape backslashes for JSON
+    ssid.replace("\"", "\\\""); // Escape quotes for JSON
+    json += "\"ssid\":\"" + ssid + "\"";
+    json += ",\"rssi\":" + String(WiFi.RSSI(i));
+    json += ",\"encrypted\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+    json += "}";
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+void handleConnect() {
+  String ssid = server.arg("ssid");
+  String password = server.arg("password");
+  memset(config.ssid, 0, sizeof(config.ssid));
+  strncpy(config.ssid, ssid.c_str(), sizeof(config.ssid) - 1);
+  
+  memset(config.password, 0, sizeof(config.password));
+  strncpy(config.password, password.c_str(), sizeof(config.password) - 1);
+  config.configured = true;
+  saveConfig();
+  server.send(200, "text/plain", "WiFi credentials saved. Rebooting...");
+  delay(1000);
+  ESP.restart();
+}
+
+void handleOverview() {
+  float avgWeight = (counters.totalReadings > 0) ? counters.totalWeight / counters.totalReadings : 0;
+  
+  String json = "{";
+  json += "\"totalReadings\":" + String(counters.totalReadings);
+  json += ",\"successfulTransmissions\":" + String(counters.successfulTransmissions);
+  json += ",\"failedTransmissions\":" + String(counters.failedTransmissions);
+  json += ",\"maxWeight\":" + String(counters.maxWeight, 2);
+  json += ",\"minWeight\":" + String(counters.minWeight, 2);
+  json += ",\"avgWeight\":" + String(avgWeight, 2);
+  json += ",\"calibrationFactor\":" + String(config.calibrationFactor, 6);
+  json += ",\"knownWeight\":" + String(config.knownWeight, 2);
+  json += ",\"unit\":\"" + currentUnit + "\"";
+  json += ",\"scaleStatus\":\"" + scaleStatus + "\"";
+  json += ",\"urlStatus\":\"" + urlStatus + "\"";
+  json += ",\"uptime\":" + String(millis() / 1000);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleCalibrationStatus() {
+  String json = "{";
+  json += "\"calibrationFactor\":" + String(config.calibrationFactor, 6);
+  json += ",\"knownWeight\":" + String(config.knownWeight, 2);
+  json += ",\"scaleStatus\":\"" + scaleStatus + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleCurrentWeight() {
+  float currentWeight = 0;
+  if (scale.is_ready()) {
+    currentWeight = scale.get_units(1);
+  }
+  
+  String json = "{";
+  json += "\"weight\":" + String(currentWeight, 2);
+  json += ",\"unit\":\"" + currentUnit + "\"";
+  json += ",\"stable\":" + String(weightStable);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleTare() {
+  if (tareScale()) {
+    server.send(200, "text/plain", "TARE SUCCESS - Scale zeroed");
+  } else {
+    server.send(200, "text/plain", "TARE FAIL - Could not zero scale");
+  }
+}
+
+void handleCalibrate() {
+  float knownWeight = server.arg("weight").toFloat();
+  if (knownWeight <= 0) {
+    server.send(200, "text/plain", "CALIBRATION FAIL - Invalid weight value");
+    return;
+  }
+  
+  if (calibrateScale(knownWeight)) {
+    server.send(200, "text/plain", "CALIBRATION SUCCESS - Factor: " + String(config.calibrationFactor, 6));
+  } else {
+    server.send(200, "text/plain", "CALIBRATION FAIL - Could not calibrate");
+  }
+}
+
+void handleResetCalibration() {
+  config.calibrationFactor = 1.0;
+  config.knownWeight = 100.0;
+  scale.set_scale(1.0);
+  saveConfig();
+  scaleStatus = "Calibration Reset";
+  server.send(200, "text/plain", "Calibration reset to defaults");
+}
+
+void handleSendWeight() {
+  float currentWeight = 0;
+  if (scale.is_ready()) {
+    currentWeight = scale.get_units(1);
+  }
+  
+  if (forwardWeightToServer(currentWeight)) {
+    server.send(200, "text/plain", "Weight sent successfully: " + String(currentWeight, 2) + currentUnit);
+  } else {
+    server.send(200, "text/plain", "Failed to send weight");
+  }
+}
+
+void handleGetReadings() {
+  String json = "[";
+  for (int i = 0; i < readingCount; i++) {
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"weight\":" + String(weightList[i].weight, 2);
+    json += ",\"timestamp\":\"" + weightList[i].timestamp + "\"";
+    json += ",\"unit\":\"" + weightList[i].unit + "\"";
+    json += "}";
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+void handleAddManualReading() {
+  float weight = server.arg("weight").toFloat();
+  String unit = server.arg("unit");
+  
+  if (weight <= 0) {
+    server.send(200, "text/plain", "Invalid weight value");
+    return;
+  }
+  
+  storeWeightReading(weight);
+  server.send(200, "text/plain", "Manual reading added: " + String(weight, 2) + unit);
+}
+
+void handleClearReadings() {
+  readingCount = 0;
+  server.send(200, "text/plain", "Weight readings cleared");
+}
+
+void handleSaveConfig() {
+  String serverIP = server.arg("serverip");
+  int serverPort = server.arg("serverport").toInt();
+  int scaleID = server.arg("scaleid").toInt();
+  memset(config.serverIP, 0, sizeof(config.serverIP));
+  strncpy(config.serverIP, serverIP.c_str(), sizeof(config.serverIP) - 1);
+  config.serverPort = serverPort;
+  config.scaleID = scaleID;
+  saveConfig();
+  server.send(200, "text/plain", "Configuration saved");
+}
+
+void handleSaveScaleSettings() {
+  String unit = server.arg("unit");
+  int decimals = server.arg("decimals").toInt();
+  
+  currentUnit = unit;
+  server.send(200, "text/plain", "Scale settings saved");
+}
+
+void handleSaveNetwork() {
+  String host = server.arg("host");
+  bool dhcp = server.arg("dhcp").equals("true");
+  String ip = server.arg("ip");
+  String gateway = server.arg("gateway");
+  String mask = server.arg("mask");
+  String pdns = server.arg("pdns");
+  String sdns = server.arg("sdns");
+  
+  memset(config.host, 0, sizeof(config.host));
+  strncpy(config.host, host.c_str(), sizeof(config.host) - 1);
+  config.dhcp = dhcp;
+  
+  memset(config.ip, 0, sizeof(config.ip));
+  strncpy(config.ip, ip.c_str(), sizeof(config.ip) - 1);
+  
+  memset(config.gateway, 0, sizeof(config.gateway));
+  strncpy(config.gateway, gateway.c_str(), sizeof(config.gateway) - 1);
+  
+  memset(config.mask, 0, sizeof(config.mask));
+  strncpy(config.mask, mask.c_str(), sizeof(config.mask) - 1);
+  
+  memset(config.pdns, 0, sizeof(config.pdns));
+  strncpy(config.pdns, pdns.c_str(), sizeof(config.pdns) - 1);
+  
+  memset(config.sdns, 0, sizeof(config.sdns));
+  strncpy(config.sdns, sdns.c_str(), sizeof(config.sdns) - 1);
+  saveConfig();
+  
+  server.send(200, "text/plain", "Network configuration saved. Reboot to apply changes.");
+}
+
+void handleApplyNetwork() {
+  applyNetworkConfig();
+  server.send(200, "text/plain", "Network configuration applied. Rebooting...");
+  delay(1000);
+  ESP.restart();
+}
+
+void handleNetworkStatus() {
+  String json = "{";
+  json += "\"host\":\"" + String(config.host) + "\"";
+  json += ",\"ip\":\"" + (config.dhcp ? "" : String(config.ip)) + "\"";
+  json += ",\"gateway\":\"" + (config.dhcp ? "" : String(config.gateway)) + "\"";
+  json += ",\"mask\":\"" + (config.dhcp ? "" : String(config.mask)) + "\"";
+  
+  String dns = "";
+  if (!config.dhcp) {
+    dns = String(config.pdns);
+    if (strlen(config.sdns) > 0) {
+      dns += ", " + String(config.sdns);
+    }
+  }
+  json += ",\"dns\":\"" + dns + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleGetConfig() {
+  String json = "{";
+  json += "\"serverIP\":\"" + String(config.serverIP) + "\"";
+  json += ",\"serverPort\":" + String(config.serverPort);
+  json += ",\"scaleID\":" + String(config.scaleID);
+  json += ",\"host\":\"" + String(config.host) + "\"";
+  json += ",\"dhcp\":" + String(config.dhcp);
+  json += ",\"ip\":\"" + String(config.ip) + "\"";
+  json += ",\"gateway\":\"" + String(config.gateway) + "\"";
+  json += ",\"mask\":\"" + String(config.mask) + "\"";
+  json += ",\"pdns\":\"" + String(config.pdns) + "\"";
+  json += ",\"sdns\":\"" + String(config.sdns) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleResetCounter() {
+  String type = server.arg("type");
+  
+  if (type == "readings") counters.totalReadings = 0;
+  else if (type == "success") counters.successfulTransmissions = 0;
+  else if (type == "failed") counters.failedTransmissions = 0;
+  else if (type == "stats") {
+    counters.maxWeight = 0;
+    counters.minWeight = 0;
+    counters.totalWeight = 0;
+  }
+  
+  saveCounters();
+  server.send(200, "text/plain", "Counter reset: " + type);
+}
+
+void handleStatus() {
+  String status;
+  if (WiFi.status() == WL_CONNECTED) {
+    status = "Connected - " + WiFi.localIP().toString();
+  } else if (WiFi.getMode() == WIFI_AP) {
+    status = "AP Mode - " + WiFi.softAPIP().toString();
+  } else {
+    status = "Disconnected";
+  }
+  server.send(200, "text/plain", status);
+}
+
+void handleScaleStatus() {
+  server.send(200, "text/plain", scaleStatus);
+}
+
+void handleResetWiFi() {
+  config.configured = false;
+  saveConfig();
+  server.send(200, "text/plain", "WiFi configuration reset. Rebooting...");
+  delay(1000);
+  ESP.restart();
+}
+
+void handleFactoryReset() {
+  for (int i = 0; i < sizeof(config) + sizeof(counters); i++) {
+    EEPROM.write(i, 0);
+  }
+  EEPROM.commit();
+  
+  server.send(200, "text/plain", "Factory reset complete. Rebooting...");
+  delay(1000);
+  ESP.restart();
+}
+
+void setupWebServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/scan", HTTP_GET, handleScan);
+  server.on("/connect", HTTP_POST, handleConnect);
+  server.on("/overview", HTTP_GET, handleOverview);
+  server.on("/calibrationstatus", HTTP_GET, handleCalibrationStatus);
+  server.on("/currentweight", HTTP_GET, handleCurrentWeight);
+  server.on("/tare", HTTP_POST, handleTare);
+  server.on("/calibrate", HTTP_POST, handleCalibrate);
+  server.on("/resetcalibration", HTTP_POST, handleResetCalibration);
+  server.on("/sendweight", HTTP_POST, handleSendWeight);
+  server.on("/getreadings", HTTP_GET, handleGetReadings);
+  server.on("/addmanualreading", HTTP_POST, handleAddManualReading);
+  server.on("/clearreadings", HTTP_GET, handleClearReadings);
+  server.on("/saveconfig", HTTP_POST, handleSaveConfig);
+  server.on("/savescalesettings", HTTP_POST, handleSaveScaleSettings);
+  server.on("/savenetwork", HTTP_POST, handleSaveNetwork);
+  server.on("/applynetwork", HTTP_GET, handleApplyNetwork);
+  server.on("/networkstatus", HTTP_GET, handleNetworkStatus);
+  server.on("/getconfig", HTTP_GET, handleGetConfig);
+  server.on("/resetcounter", HTTP_POST, handleResetCounter);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/scalestatus", HTTP_GET, handleScaleStatus);
+  server.on("/resetwifi", HTTP_GET, handleResetWiFi);
+  server.on("/factoryreset", HTTP_GET, handleFactoryReset);
+
+  server.begin();
+  Serial.println("HTTP server started on port 80");
+  Serial.println("Access point: ESP32-SCALE");
+  Serial.println("Password: password");
+  Serial.println("Default IP: http://" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString()));
+}
